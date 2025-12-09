@@ -91,6 +91,155 @@ OCEAN/
 
 ---
 
+## 2.5 Workload Execution Modes - Where Do Workloads Run?
+
+OCEAN supports **two distinct execution modes** for workloads:
+
+### Mode 1: Host-Based Execution (Process Tracing)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         HOST SYSTEM                              │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │                    CXLMemSim Binary                       │   │
+│  │  ./CXLMemSim -t ./microbench/ld1 -p 1000                 │   │
+│  │                         │                                 │   │
+│  │         ┌───────────────┴───────────────┐                │   │
+│  │         ▼                               ▼                │   │
+│  │  ┌─────────────┐              ┌─────────────────┐        │   │
+│  │  │   Target    │   ptrace     │   CXL Memory    │        │   │
+│  │  │  Process    │◄────────────►│   Controller    │        │   │
+│  │  │ (workload)  │   intercept  │   + Policies    │        │   │
+│  │  └─────────────┘              └─────────────────┘        │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  Workload runs: DIRECTLY ON HOST (traced by CXLMemSim)          │
+│  CXL Memory:    EMULATED via latency injection                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**How it works:**
+1. CXLMemSim **spawns the target workload** as a child process
+2. Uses **ptrace** and **PEBS** (Processor Event-Based Sampling) to intercept memory accesses
+3. **Injects latency** to simulate CXL memory behavior
+4. Collects PMU counters for analysis
+
+**Use cases:**
+- Microbenchmarks (`ld1`, `st64`, etc.)
+- Single-node workloads (GAPBS, LLaMA, GROMACS single-node)
+- Performance characterization and calibration
+
+**Example:**
+```bash
+# Workload runs on HOST, CXL behavior is emulated
+./CXLMemSim -t ./microbench/ld1 -p 1000 \
+    -l "200,250,200,250,200,250" \
+    -b "50,50,50,50,50,50"
+```
+
+---
+
+### Mode 2: Guest VM Execution (Multi-Host Emulation)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         HOST SYSTEM                              │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────┐     │
+│  │              CXLMemSim Server (Port 9999)               │     │
+│  │  ┌─────────────────────────────────────────────────┐   │     │
+│  │  │  Shared Memory: /dev/shm/cxlmemsim_shared (2GB) │   │     │
+│  │  └─────────────────────────────────────────────────┘   │     │
+│  └──────────────────────────┬─────────────────────────────┘     │
+│                             │                                    │
+│         ┌───────────────────┼───────────────────┐               │
+│         │                   │                   │               │
+│  ┌──────┴──────┐    ┌───────┴───────┐   ┌───────┴───────┐      │
+│  │  QEMU VM 0  │    │   QEMU VM 1   │   │   QEMU VM N   │      │
+│  │   (node0)   │    │    (node1)    │   │    (nodeN)    │      │
+│  │             │    │               │   │               │      │
+│  │ ┌─────────┐ │    │ ┌───────────┐ │   │ ┌───────────┐ │      │
+│  │ │WORKLOAD │ │    │ │ WORKLOAD  │ │   │ │ WORKLOAD  │ │      │
+│  │ │(GROMACS)│ │    │ │ (GROMACS) │ │   │ │ (TIGON)   │ │      │
+│  │ └────┬────┘ │    │ └─────┬─────┘ │   │ └─────┬─────┘ │      │
+│  │      │      │    │       │       │   │       │       │      │
+│  │ ┌────┴────┐ │    │ ┌─────┴─────┐ │   │ ┌─────┴─────┐ │      │
+│  │ │CXL Type3│ │    │ │CXL Type-3 │ │   │ │CXL Type-3 │ │      │
+│  │ │/dev/dax │ │    │ │ /dev/dax  │ │   │ │ /dev/dax  │ │      │
+│  │ └─────────┘ │    │ └───────────┘ │   │ └───────────┘ │      │
+│  └─────────────┘    └───────────────┘   └───────────────┘      │
+│                                                                  │
+│  Workloads run: INSIDE GUEST VMs                                │
+│  CXL Memory:    REAL shared memory via DAX device               │
+│  Multi-host:    VMs communicate via bridge network              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**How it works:**
+1. **CXLMemSim Server** runs on host, manages shared memory pool
+2. **QEMU VMs** boot with CXL Type-3 device backed by shared memory
+3. **Inside each VM**: CXL memory appears as `/dev/dax0.0` (DAX device)
+4. **Workloads run inside VMs** and access CXL memory via DAX
+5. **MPI shim layer** redirects MPI allocations to CXL memory
+
+**Use cases:**
+- Multi-host distributed workloads (GROMACS MPI, TIGON)
+- CXL memory pooling scenarios
+- Coherent memory sharing experiments
+- Real CXL software stack testing
+
+**Example:**
+```bash
+# On HOST: Start server
+./start_server.sh 9999 topology_simple.txt
+
+# On HOST: Launch VMs
+sudo ./launch_qemu_cxl.sh   # VM0
+sudo ./launch_qemu_cxl1.sh  # VM1
+
+# INSIDE VM (Guest OS): Run workload
+export CXL_DAX_PATH="/dev/dax0.0"
+export LD_PRELOAD=/root/libmpi_cxl_shim.so
+mpirun -np 2 -hostfile hostfile ./gmx_mpi mdrun -s input.tpr
+```
+
+---
+
+### Comparison of Execution Modes
+
+| Aspect | Mode 1: Host-Based | Mode 2: Guest VM |
+|--------|-------------------|------------------|
+| **Where workload runs** | Directly on host | Inside QEMU guest OS |
+| **CXL memory** | Emulated (latency injection) | Real shared memory (DAX) |
+| **Multi-host support** | No (single process) | Yes (multiple VMs) |
+| **Accuracy** | Approximate (PMU-based) | High (actual memory access) |
+| **Setup complexity** | Low (single binary) | High (QEMU + VMs) |
+| **Use case** | Benchmarking, calibration | Distributed apps, pooling |
+| **Scripts** | `get_all_results.py` | `launch_qemu_cxl*.sh` |
+
+---
+
+### Guest OS Environment (Inside VMs)
+
+When workloads run inside QEMU VMs, the guest OS sees:
+
+```
+Guest OS View:
+├── /dev/dax0.0          # CXL memory as DAX device
+├── NUMA Node 1          # CXL memory as separate NUMA node
+├── 192.168.100.X/24     # Network to other VMs
+└── /mnt/hostshm/        # 9p mount to host /dev/shm (optional)
+```
+
+**Guest OS Setup** (automatic via `setup_cxl_numa.sh`):
+1. Load CXL kernel modules
+2. Create CXL region and DAX namespace
+3. Configure network interface
+4. (Optional) Online CXL memory as system RAM
+
+---
+
 ## 3. Infrastructure Setup
 
 ### 3.1 Prerequisites
